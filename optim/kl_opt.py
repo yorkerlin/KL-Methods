@@ -28,21 +28,20 @@ class KLOpt(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        lr: float = 3e-3,
-        betas=(0.95, 0.95),
+        lr: float = 1e-4,
+        betas=(0.9, 0.98),
         shampoo_beta: float= -1,
         eps: float = 1e-8,
         weight_decay: float = 0.01,
         precondition_frequency: int=10,
-
+        using_klsoap: bool = False, #KL-Shampoo if False; KL-SOAP if True
 
         normalize_grads: bool = False,
         init_factor: float = 0.1,
         using_damping: bool = False,
 
         using_clamping: bool = True,
-        max_clamp_value: int = 2500,
-        using_klsoap: bool = False, #KL-Shampoo if False; KL-SOAP if True
+        max_clamp_value: int = 4000,
         cast_dtype = torch.bfloat16, #use bfloat16 for all the computation (except the QR/eigen decomposition)
     ):
         defaults = {
