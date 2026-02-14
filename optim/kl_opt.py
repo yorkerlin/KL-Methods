@@ -38,9 +38,9 @@ class KLOpt(torch.optim.Optimizer):
 
         normalize_grads: bool = False,
         init_factor: float = 0.1,
-        using_damping: bool = False,
+        using_damping: bool = False, #using damping in the curvature learning
 
-        using_clamping: bool = True,
+        using_clamping: bool = True, #using clamping in the eigenvalue estimation 
         max_clamp_value: int = 4000,
         cast_dtype = torch.bfloat16, #use bfloat16 for all the computation (except the QR/eigen decomposition)
     ):
@@ -116,6 +116,8 @@ class KLOpt(torch.optim.Optimizer):
         sqrt_inv_d = (1.0/torch.sqrt(D)).nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
         if self.using_clamping:
             sqrt_inv_d = torch.clamp(sqrt_inv_d, max=max(10, min(D.shape[0], self.max_clamp_value))) #clamp the inv_sqrt_eigen_value
+
+        #we store the inv_sqrt_eigen_value rather than the eigen_value (D)
         state['eigen_sqrt_inv'][idx] = sqrt_inv_d
 
 
