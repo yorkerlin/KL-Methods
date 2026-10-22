@@ -14,7 +14,6 @@ def qr_positive_diag(A):
     return Q
 
 
-
 class KLOpt(torch.optim.Optimizer):
     """
     KLShampoo and KLSOAP
@@ -33,26 +32,22 @@ class KLOpt(torch.optim.Optimizer):
         weight_decay (`float`, *optional*, defaults to 0.01): weight decay coefficient.
         precondition_frequency (`int`, *optional*, defaults to 10):
             How often to update the preconditioner.
-        normalize_grads (`bool`, *optional*, defaults to `False`):
-            Whether or not to normalize gradients per layer. 
     """
 
     def __init__(
         self,
         params,
         lr: float = 1e-4,
-        betas=(0.9, 0.98),
+        betas=(0.9, 0.98), #depends on the batch size (for a large batch size, use beta2 = 0.95)
         shampoo_beta: float= -1,
-        eps: float = 1e-8,
+        eps: float = 1e-9,
         weight_decay: float = 0.01,
         precondition_frequency: int=10,
         using_klsoap: bool = False, #KL-Shampoo if False; KL-SOAP if True
 
-        normalize_grads: bool = False,
-        init_factor: float = 0.1,
-        using_damping: bool = False, #using damping in the curvature learning
+        init_factor: float = 1e-3,
 
-        using_clamping: bool = True, #using clamping in the eigenvalue estimation 
+        using_clamping: bool = True, #using clamping in the eigenvalue estimation
         max_clamp_value: int = 4000,
         cast_dtype = torch.bfloat16, #use bfloat16 for all the computation (except the QR/eigen decomposition)
     ):
@@ -63,8 +58,9 @@ class KLOpt(torch.optim.Optimizer):
             "eps": eps,
             "weight_decay": weight_decay,
             "precondition_frequency": precondition_frequency,
-            "normalize_grads": normalize_grads,
         }
+
+        self.precondition_frequency = precondition_frequency
         self.cast_dtype = cast_dtype
         self.using_klsoap = using_klsoap
         class_name = 'kl-shampoo'
@@ -79,18 +75,11 @@ class KLOpt(torch.optim.Optimizer):
             print('no clamping')
 
         self.init_factor = init_factor
-        self.using_damping = using_damping
-        if using_damping:
-            print('using damping in the curvature learning')
-            self.damping = eps
-        else:
-            print('no damping in the curvature learning')
-            self.damping = 0.0
 
         super().__init__(params, defaults)
         print('init factor:', self.init_factor)
         print('cast dtype:', self.cast_dtype)
-        print('___________________________________%s org___________________________________'%class_name)
+        print('___________________________________%s public___________________________________'%class_name)
 
 
     def init_preconditioner(self, grad, state, precondition_frequency=10,
@@ -117,67 +106,20 @@ class KLOpt(torch.optim.Optimizer):
 
 
     @torch.compile
-    def update_eigen_value(self, state, diag, idx, beta, traces, total_trace, damping):
-        if damping > 0:
-            diag = diag + total_trace/traces[idx]
-
+    def update_eigen_value(self, state, diag, idx, beta):
         #update the eigen values of the curvature (every iteration)
         inv_d = state['eigen_sqrt_inv'][idx]**2
         D = torch.squeeze(1.0/inv_d).nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
         D.lerp_(diag, 1.0-beta)
+
         sqrt_inv_d = (1.0/torch.sqrt(D)).nan_to_num_(nan=0.0, posinf=0.0, neginf=0.0)
         if self.using_clamping:
-            sqrt_inv_d = torch.clamp(sqrt_inv_d, max=max(10, min(D.shape[0], self.max_clamp_value))) #clamp the inv_sqrt_eigen_value
-
-        #we store the inv_sqrt_eigen_value rather than the eigen_value (D)
+            sqrt_inv_d = torch.clamp(sqrt_inv_d, max=self.max_clamp_value) #####
         state['eigen_sqrt_inv'][idx] = sqrt_inv_d
 
 
     @torch.compile
-    def update_3d_preconditioner(self, grad, state, total_factor, traces, total_trace,  damping):
-        assert grad.dim() == 3 #only support 3d tensors
-        invS_half = []
-        for idx in range(grad.dim()):
-            invS_h = state['Q'][idx] * state['eigen_sqrt_inv'][idx].view(1,-1)
-            invS_half.append(invS_h)
-
-        G = grad
-        beta = state["shampoo_beta"]
-
-        GinvS1h = torch.einsum('ija,ip->pja', G, invS_half[1-1]) #G invS1
-        GinvS1Q2 = torch.einsum('pja,jl->pla', GinvS1h, state['Q'][2-1]) #G invS1 Q2
-        GinvS1Q2Q3 = torch.einsum('pqa,am->pqm', GinvS1Q2, state['Q'][3-1])#G invS1 Q2 Q3
-
-        GinvS12h = GinvS1Q2 * state['eigen_sqrt_inv'][2-1].view(1,-1,1) #G invS1 invS2
-        GinvS12G_T = torch.tensordot(GinvS12h,GinvS12h, dims=[[0,1],[0,1]]) #for S3
-        self.update_S(G, state, GinvS12G_T, 3-1, beta, total_factor) #update S3
-
-        GinvS1Q3 = torch.einsum('pqb,bm->pqm', GinvS1h, state['Q'][3-1]) #G invS1 Q3
-        GinvS13h = GinvS1Q3 * state['eigen_sqrt_inv'][3-1].view(1,1,-1) #G invS1 invS3
-        GinvS13G_T = torch.tensordot(GinvS13h,GinvS13h, dims=[[0,2],[0,2]]) #for S2
-        self.update_S(G, state, GinvS13G_T, 2-1, beta, total_factor) #update S2
-
-        diag3 = torch.mean( (GinvS1Q2Q3*state['eigen_sqrt_inv'][2-1].view(1,-1,1))**2, dim=(0,1) ) #torch.diag( Q3.T @ GinvS12G_T @ Q3 )/(d1*d2) #for diag(S3)
-        self.update_eigen_value(state, diag3, 3-1, beta, traces, total_trace, damping)
-
-        diag2 = torch.mean( (GinvS1Q2Q3*state['eigen_sqrt_inv'][3-1].view(1,1,-1))**2, dim=(0,2) ) #torch.diag( Q2.T @ GinvS13G_T @ Q2 )/(d1*d3) #for diag(S2)
-        self.update_eigen_value(state, diag2, 2-1, beta, traces, total_trace, damping)
-
-
-        GinvS3h = torch.einsum('ijb,bm->ijm', G, invS_half[3-1]) #G invS3
-        GinvS3Q2 = torch.einsum('ijm,jq->iqm', GinvS3h, state['Q'][2-1])
-        GinvS3Q2Q1 = torch.einsum('iqm,ip->pqm', GinvS3Q2, state['Q'][1-1]) #G invS3 Q2 Q1
-
-        GinvS32h = GinvS3Q2 * state['eigen_sqrt_inv'][2-1].view(1,-1,1) #G invS3 invS2
-        GinvS32G_T = torch.tensordot(GinvS32h,GinvS32h, dims=[[1,2],[1,2]]) #for S1
-        self.update_S(G, state, GinvS32G_T, 1-1, beta, total_factor) #update S1
-
-        diag1 = torch.mean( (GinvS3Q2Q1*state['eigen_sqrt_inv'][2-1].view(1,-1,1))**2, dim=(1,2) ) #torch.diag( Q1.T @ GinvS32G_T @ Q1 )/(d2*d3) #for diag(S1)
-        self.update_eigen_value(state, diag1, 1-1, beta, traces, total_trace, damping)
-
-
-    @torch.compile
-    def update_2d_preconditioner(self, grad, state, total_factor, traces, total_trace, damping):
+    def update_2d_preconditioner(self, grad, state, total_factor):
         assert grad.dim() == 2 #only support 2d tensors
         beta = state["shampoo_beta"]
 
@@ -200,8 +142,8 @@ class KLOpt(torch.optim.Optimizer):
         ldiag = torch.mean( (diag_half * state['eigen_sqrt_inv'][1].view(1,-1))**2, 1)
         rdiag = torch.mean( (diag_half * state['eigen_sqrt_inv'][0].view(-1,1))**2, 0)
 
-        self.update_eigen_value(state, ldiag, 1-1, beta, traces, total_trace, damping)
-        self.update_eigen_value(state, rdiag, 2-1, beta, traces, total_trace, damping)
+        self.update_eigen_value(state, ldiag, 1-1, beta)
+        self.update_eigen_value(state, rdiag, 2-1, beta)
 
 
     @torch.no_grad()
@@ -209,24 +151,11 @@ class KLOpt(torch.optim.Optimizer):
         """
         Updates the preconditioner matrices and the eigenbases (L, R, Q_L, Q_R in the paper).
         """
-        traces = []
         total_factor = torch.numel(grad)
-        damping = 0.0 #do not add damping in the curvature learning
-        if self.using_damping:
-            damping = self.damping
-        total_trace = damping
-
-        if damping > 0:
-            for idx, sh in enumerate(grad.shape):
-                if state['Q'] is None:
-                    cur_trace = 1.0 #average
-                else:
-                    cur_trace = torch.mean(state['eigen_sqrt_inv'][idx]**2) #average
-                total_trace *= cur_trace
-                traces.append(cur_trace)
 
         if state['Q'] is None:
             beta = state["shampoo_beta"]
+            tmp = []
             for idx, sh in enumerate(grad.shape):
                 mat = torch.tensordot(
                         grad,
@@ -234,23 +163,24 @@ class KLOpt(torch.optim.Optimizer):
                         # Contracts across all dimensions except for k.
                         dims=[[*chain(range(idx), range(idx + 1, len(grad.shape)))]] * 2,
                     )
-                self.update_S(grad, state, mat, idx, beta, total_factor)
+                tmp.append(mat)
+                factor = total_factor/grad.shape[idx]
+                state['GG'][idx] = mat/factor
+                state['GG'][idx].diagonal().add_(1e-8) #better
 
-            state['Q'], state['eigen_sqrt_inv'] = self.get_orthogonal_matrix(state['GG'])
+            state['Q'], state['eigen_sqrt_inv'] = self.get_orthogonal_matrix(tmp)
+            return                            # the statistic is diagonal in Q0: nothing to refresh at this step
         else:
             if self.using_klsoap and state['step'] % state['precondition_frequency'] == 0:
                 state["exp_avg"] = self.project_back(state["exp_avg"], state)
 
-            if len(grad.shape)==2:
-                self.update_2d_preconditioner(grad, state, total_factor, traces, total_trace,  damping)
-            elif len(grad.shape)==3:
-                self.update_3d_preconditioner(grad, state, total_factor, traces, total_trace,  damping)
-            else:
-                #only support up to 3d tensors for now
-                assert False
+            assert len(grad.shape)==2
+            #only support 2d weights for now
+            self.update_2d_preconditioner(grad, state, total_factor)
 
-        if state['step'] > 0 and state['step'] % state['precondition_frequency'] == 0:
-            #update the eigen bases of the curvature (every T iterations)
+        if state['step'] < 10 or state['step'] % state['precondition_frequency'] == 0:
+            #update the basis at the first 10 steps
+            #update the basis of the curvature (every T iterations)
             state['Q'] = self.get_orthogonal_matrix_QR(state)
             if self.using_klsoap:
                 state["exp_avg"] = self.project(state["exp_avg"], state)
@@ -268,17 +198,17 @@ class KLOpt(torch.optim.Optimizer):
             loss = None
         else:
             loss = closure()
-        
+
         for group in self.param_groups:
             for p in group["params"]:
                 if p.grad is None:
                     continue
                 grad = torch.squeeze( p.grad.to(dtype=self.cast_dtype) )
                 state = self.state[p]
-                
+
                 if "step" not in state:
                     state["step"] = 0
-                    
+
                 # State initialization
                 if "exp_avg" not in state:
                     # Exponential moving average of gradient values
@@ -295,7 +225,7 @@ class KLOpt(torch.optim.Optimizer):
                     )
                     self.update_preconditioner(grad, state)
                     continue # first step is skipped so that we never use the current gradients in the projection.
-                
+
                 state["step"] += 1
 
                 if self.using_klsoap:
@@ -304,28 +234,22 @@ class KLOpt(torch.optim.Optimizer):
                     norm_grad = self.klshampoo_update(state, grad, group["betas"][0], group['eps'])
                 self.update_preconditioner(grad, state)
 
-                if group["normalize_grads"]:
-                    norm_grad = norm_grad / (1e-30+torch.mean(norm_grad**2)**0.5)
-                
                 step_size = group["lr"]
-                p.add_(norm_grad.view(p.shape), alpha=-step_size)
 
                 if group["weight_decay"] > 0.0:
                     p.add_(p, alpha=(-group["lr"] * group["weight_decay"]))
-                    
+                p.add_(norm_grad.view(p.shape), alpha=-step_size)
+
         return loss
+
 
     def klshampoo_update(self, state, grad, beta1, damping):
         exp_avg = state["exp_avg"]
         exp_avg.lerp_(grad, 1.0-beta1)
 
         grad_projected = self.project(exp_avg, state)
-        if len(grad.shape) == 2:
-            eigen_sqrt_inv = state['eigen_sqrt_inv'][0].view(-1,1) * state['eigen_sqrt_inv'][1].view(1,-1)
-        elif len(grad.shape) == 3:
-            eigen_sqrt_inv = state['eigen_sqrt_inv'][0].view(-1,1,1) * state['eigen_sqrt_inv'][1].view(1,-1,1) * state['eigen_sqrt_inv'][2].view(1,1,-1)
-        else:
-            assert False
+        #only support 2d weights now
+        eigen_sqrt_inv = state['eigen_sqrt_inv'][0].view(-1,1) * state['eigen_sqrt_inv'][1].view(1,-1)
 
         eigen_sqrt_inv.div_( 1.0 + (eigen_sqrt_inv * damping) )
         precond_grad = grad_projected * eigen_sqrt_inv
@@ -366,9 +290,9 @@ class KLOpt(torch.optim.Optimizer):
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
-        
+
         return grad
- 
+
     def project_back(self, grad, state):
         """
         Projects the gradient back to the original space.
@@ -384,9 +308,9 @@ class KLOpt(torch.optim.Optimizer):
             else:
                 permute_order = list(range(1, len(grad.shape))) + [0]
                 grad = grad.permute(permute_order)
-                
+
         return grad
-        
+
 
     def get_orthogonal_matrix(self, mat):
         """
@@ -405,7 +329,7 @@ class KLOpt(torch.optim.Optimizer):
             else:
                 float_data = True
                 matrix.append(m.data)
-        
+
         final = []
         info = []
         assert len(matrix) == len(mat)
@@ -431,9 +355,9 @@ class KLOpt(torch.optim.Optimizer):
 
             if not float_data:
                 Q = Q.to(device=original_device, dtype=original_type)
+
             final.append(Q)
         return final, info
-        
 
     def get_orthogonal_matrix_QR(self, state):
         """
@@ -457,7 +381,7 @@ class KLOpt(torch.optim.Optimizer):
                 float_data = True
                 matrix.append(m.data.float())
                 orth_matrix.append(o.data.float())
-        
+
         final = []
         for ind, (m,o) in enumerate(zip(matrix, orth_matrix)):
             power_iter = m @ o
@@ -465,5 +389,6 @@ class KLOpt(torch.optim.Optimizer):
 
             if not float_data:
                 Q = Q.to(device=original_device, dtype=original_type)
+
             final.append(Q)
         return final
