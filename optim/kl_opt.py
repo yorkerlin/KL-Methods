@@ -3,6 +3,18 @@ import torch.nn as nn
 import torch.optim as optim
 from itertools import chain
 
+def qr_positive_diag(A):
+    Q, R = torch.linalg.qr(A)
+    # signs of the diagonal of R
+    signs = torch.sign(torch.diag(R))
+    # handle exact zeros on diagonal (degenerate case)
+    signs[signs == 0] = 1
+    # flip columns of Q and rows of R
+    Q = Q * signs.unsqueeze(0)   # broadcast over rows
+    return Q
+
+
+
 class KLOpt(torch.optim.Optimizer):
     """
     KLShampoo and KLSOAP
@@ -449,7 +461,7 @@ class KLOpt(torch.optim.Optimizer):
         final = []
         for ind, (m,o) in enumerate(zip(matrix, orth_matrix)):
             power_iter = m @ o
-            Q, _ = torch.linalg.qr(power_iter)
+            Q = qr_positive_diag(power_iter)
 
             if not float_data:
                 Q = Q.to(device=original_device, dtype=original_type)
