@@ -21,13 +21,13 @@ class KLOpt(torch.optim.Optimizer):
     Parameters:
         params (`Iterable[nn.parameter.Parameter]`):
             Iterable of parameters to optimize or dictionaries defining parameter groups.
-        lr (`float`, *optional*, defaults to 0.003):
+        lr (`float`, *optional*, defaults to 0.0001):
             The learning rate to use.
-        betas (`Tuple[float,float]`, *optional*, defaults to `(0.95, 0.95)`):
+        betas (`Tuple[float,float]`, *optional*, defaults to `(0.9, 0.98)`):
             Adam's betas parameters (b1, b2).
         shampoo_beta (`float`, *optional*, defaults to -1):
             If >= 0, use this beta for the preconditioner (L and R in paper, state['GG'] below) moving average instead of betas[1].
-        eps (`float`, *optional*, defaults to 1e-08):
+        eps (`float`, *optional*, defaults to 1e-09):
             Adam's epsilon for numerical stability.
         weight_decay (`float`, *optional*, defaults to 0.01): weight decay coefficient.
         precondition_frequency (`int`, *optional*, defaults to 10):
@@ -46,7 +46,6 @@ class KLOpt(torch.optim.Optimizer):
         using_klsoap: bool = False, #KL-Shampoo if False; KL-SOAP if True
 
         init_factor: float = 1e-3,
-
         using_clamping: bool = True, #using clamping in the eigenvalue estimation
         max_clamp_value: int = 4000,
         cast_dtype = torch.bfloat16, #use bfloat16 for all the computation (except the QR/eigen decomposition)
@@ -99,7 +98,7 @@ class KLOpt(torch.optim.Optimizer):
         state['shampoo_beta'] = shampoo_beta
 
 
-    @torch.compile
+    @torch.compile(options={'pattern_matcher': False})
     def update_S(self, grad, state, mat, idx, beta, total_factor):
         factor = total_factor/grad.shape[idx]
         state['GG'][idx].mul_(beta).add_(mat, alpha=(1.0-beta)/factor)
@@ -118,7 +117,7 @@ class KLOpt(torch.optim.Optimizer):
         state['eigen_sqrt_inv'][idx] = sqrt_inv_d
 
 
-    @torch.compile
+    @torch.compile(options={'pattern_matcher': False})
     def update_2d_preconditioner(self, grad, state, total_factor):
         assert grad.dim() == 2 #only support 2d tensors
         beta = state["shampoo_beta"]
@@ -171,7 +170,7 @@ class KLOpt(torch.optim.Optimizer):
             state['Q'], state['eigen_sqrt_inv'] = self.get_orthogonal_matrix(tmp)
             return                            # the statistic is diagonal in Q0: nothing to refresh at this step
         else:
-            if self.using_klsoap and state['step'] % state['precondition_frequency'] == 0:
+            if self.using_klsoap and (state['step'] < 10 or state['step'] % state['precondition_frequency'] == 0):
                 state["exp_avg"] = self.project_back(state["exp_avg"], state)
 
             assert len(grad.shape)==2
